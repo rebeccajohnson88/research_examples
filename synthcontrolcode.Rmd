@@ -1,0 +1,133 @@
+---
+title: "synthetic control code"
+author: "Rebecca Johnson"
+date: "February 1, 2017"
+output: html_document
+---
+
+This code implements the placebo testing for synthetic control that is described in Abadie, Diamond, and Hainmmueller (2010): \url{http://economics.mit.edu/files/11859}
+
+I describe each step in turn.
+
+# Step one: iterate through each 'donor' unit and pretend it was the treatment unit
+
+Donor units are observations (e.g., states; countries; schools) that are eligible to receive the treatment but that are not treated. The reason they're called donors is that when constructing the synthetic control, they form the pool of units that can be used for the composite/synthetic unit whose counterfactual outcomes we're comparing to the treatment state's outcomes. 
+
+In this case, I am looking at policies that affect a state (WV in the below code) and so my donor units are states that were eligible to be treated by the policy WV treated to (only a subset of U.S. states since some had already switched to that treatment) but not treated. From now on, rather than referring to treatment and donor units, I'll refer to treatment and donor states.
+
+The first step in placebo testing is to iterate through each of these donor states and pretend it was the treatment state and re-estimate whatever synthetic control model (e.g., same covariates; same pre-treatment v. post-treatment years) you ran on the actual treatment state. I do this using a loop.
+
+```{r}
+##load package
+library(synth)
+
+gapsplacebowv <- c() #empty vector to store gaps between tx state and control
+treatpoolwv <- c(2:33) #indicators for all the donor states 
+
+##loop iterates through the donor states
+##and returns a data.frame with the gaps between the treatment
+##and control for each donor state
+for(i in treatpoolwv){
+  allcontrols <- 2:33 #indices for all the donor states
+  txindex <- which(allcontrols == i) #tells loop to treat state i as tx state for this iteration
+  controlsnotx <- allcontrols[-txindex] #states not indexed below are the controls
+  
+  ##data preparation step for synth package
+  ##note that the treatment.identifier is i and the controls are all
+  ##indices other than i
+  synthdataprepplacebo <- dataprep(foo = synthwithidwv,
+                                   predictors = c("finalpercentspecialed", 
+                                                  "stateunemployrate",
+                                                  "singleparentpercent",
+                                                  "leg_cont",
+                                                  "totalpopinmil"),
+                                   predictors.op = "mean",
+                                   time.predictors.prior = 2000:2008,
+                                   dependent = "finalpercentspecialed",
+                                   unit.variable = "stateno",
+                                   unit.names.variable = "statechar",
+                                   time.variable = "year",
+                                   treatment.identifier = i,
+                                   controls.identifier = controlsnotx,
+                                   time.optimize.ssr = 2000:2008,
+                                   time.plot = 2000:2011)
+  try(synthoutplacebo <- synth(data.prep.obj = synthdataprepplacebo)) 
+  
+  ##synthetic control outcome: weights each control states outcome by its weight 
+  ycontrolplac <- synthdataprepplacebo$Y0plot %*% synthoutplacebo$solution.w
+  
+  ##treatment outcome
+  ytreatedplac <- synthdataprepplacebo$Y1plot 
+  
+  ##for each state, creates a data.frame with the year in question
+  #the outcome values for the synthetic control (ycontrolplace),
+  ##the outcome values for the treatment (ytreatedplac), and 
+  ##which donor state these outcomes refer to
+  yearsplac <- seq(from = 2000, to = 2011, by = 1)
+  statenames <- unique(synthwithidwv$statechar)
+  stateplac <- rep(statenames[i], times = 12) 
+  statedatawv <- cbind.data.frame(yearsplac, ycontrolplac, ytreatedplac, stateplac,
+                                  stringsAsFactors = FALSE)
+  colnames(statedatawv) <- c("year", "control", "treated", "state treated") 
+  
+  ##binds the above data.frame for all donor states that the loop
+  ##iterates through
+  gapsplacebowv <- rbind.data.frame(gapsplacebowv, statedatawv)
+}
+
+##calculates gaps outside loop as treatment outcome - control outcome
+##but can also be calculated inside
+gapsplacebowv$gap <- gapsplacebowv$treated - gapsplacebowv$control 
+colnames(gapsplacebowv)[4] <- "statetreated" 
+
+
+```
+
+
+# Step two: calculate the RMSPE ratios during the post/pre-policy periods for these placebo states
+
+We then calculate two quantities, defined more formally below:
+
+\begin{enumerate}
+\item Pre-policy root mean squared prediction error (RMSPE): this looks at the gap between the treatment and synthetic control unit in the pre-policy period; the synthetic control is weighted to minimize this gap and you want it to be as small as possible
+\item Post-policy RMSPE: if the policy has an effect on your outcome (in this case, special education placement rates), then the treatment and control units should diverge and this should be large
+\end{enumerate}
+
+The larger the ratio between 1 and 2, the more the treatment state and its counterfactual started to diverge in outcomes after the policy. You've already calculated this ratio for the treatment state during the main part of teh analysis. Now, you want to calculate it for each of the donor states that, in the placebo testing, you're pretending was treated. The reason is that for a causal interpretation, you want the treatment state's ratio to be as large as possible. But since there's no standard for what a large enough ratio is to 'count' as a causal effect, one way to contextualize whether the divergence in outcomes between the treatment unit and control unit is large is to compare this ratio for the actual treatment unit to a ratio for a donor state pretending that its a treatment state for the purposes of placebo testing. 
+
+More formally, the placebo tests calculate the following ratio, where Y represents the outcome (in this case, the special education placement rate) in the treatment unit (the real treatment state or a placebo treatment) or the weighted control unit ($Y_{syntheticcontrolstate} = \sum_{j = 1}^{J} Y_{statej} * weight_{statej})$ where j refers to each state with a non-zero weight, and in the following equation, $N_{2}$ = number of post-treatment years and $N_{1}$ = number of pre-treatment years:
+\begin{enumerate}[label = (\Alph*)]
+\item Post-policy root mean squared prediction error (RMSPE) (first year of policy to 2011):\\ \\ 
+$\sqrt{\frac{1}{N_{2}}*\sum\limits_{i = firstyearpol}^{2011}({Ytreat}_{i} -{Ysynth}_{i})^{2}}$  
+\item Pre-policy root mean squared prediction error (2000 to last year pre-policy):\\ \\ 
+$\sqrt{\frac{1}{N_{1}}*\sum\limits_{i = 2000}^{lastyearprepol}({Ytreat}_{i} -{Ysynth}_{i})^{2}}$ 
+\item Post to pre ratio: A / B
+\end{enumerate}
+If the policy did have an effect in the treatment state, we would expect the state's post to pre ratios to be among the largest in these placebo tests, since we expect the treatment to cause a divergence in the outcomes (in this case, special education rates) for a treatment state in the post-policy period. 
+
+The below function helps us calculate quantity 3 for each donor state.
+
+
+```{r}
+prepostmspe.function.mat.wv <- function(i) {
+  state.names <- unique(gapsplacebowv$statetreated)
+  state.group <- subset(gapsplacebowv, subset = (statetreated == state.names[i])) #subset to state i
+  prepolstate <- state.group[state.group$year < 2009, ] #pre-policy outcomes
+  rootpremspestate <- sqrt(mean(prepolstate$gap ^ 2)) #pre-policy rmspe
+  postpolstate <- state.group[state.group$year > 2008, ]  #post-policy outcomes
+  rootpostmspestate <- sqrt(mean(postpolstate$gap ^ 2)) #post-policy rmspe
+  postpreratiostate <- rootpostmspestate / rootpremspestate #post/pre ratio
+  mspestate <- cbind(rootpremspestate, rootpostmspestate, postpreratiostate) #bind above quantities
+  return (mspestate)
+}                
+
+x <- seq(1:32) 
+mspematwv <- sapply(x, prepostmspe.function.mat.wv) #apply function to all states
+mspematdatawv <- as.data.frame(t(mspematwv)) 
+rownames(mspematdatawv) <- unique(gapsplacebowv$statetreated) 
+colnames(mspematdatawv) <- c("premspe", "postmspe", "postpreratio") 
+
+```
+
+
+The final step in placebo testing is to order the post-policy to pre-policy ratios from largest to smallest and calculate the treatment unit's rank in this ordered list. A lower rank means a larger gap post-policy gap relative to placebo units, and potentially a more causal interpretation of the policy. 
