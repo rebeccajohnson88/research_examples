@@ -1,0 +1,529 @@
+---
+title: "Extending YH to investigate variability in estimate from unmodeled nonlinearities"
+author: "Soc stats team"
+date: "11/10/2017"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+# Overview:
+
+The following code implements and extends the method for checking the robustness of a treatment coefficient of interest from the following citation:
+
+Young, Cristobal, and Katherine Holsteen. "Model Uncertainty and Robustness: A Computational Framework for Multimodel Analysis." *Sociological Methods & Research* 46, no. 1 (2017): 3-40.
+
+In particular, the authors of that article release a module for STATA (mrobust) that has a function that tests the robustness of a model across all possible combinations of specified model ingredients like which control variables are included
+
+The following functions allow us to implement the same approach in R with two sets of model ingredients:
+
+1. Which control variables does the model include?
+2. Since one model assumption/ingredient is whether we constrain the relationship between the control variables and the outcome variable to be linear, another function allows us to relax this combination and test all combinations of smoothing parameters we can put on continuous controls. We will then use these smoothing parameters to estimate a Generalized Additive Model (GAM), a semi-parametric approach that retains the additivity assumption about control variables (control variables have an additive relationship with the outcome) but relaxes the linearity assumption.
+
+
+
+# Load packages
+
+```{r, warning = FALSE, message = FALSE}
+library(tidyverse)
+library(stargazer)
+library(mgcv)
+library(foreign)
+library(stringr)
+library(xtable)
+library(foreign)
+library(itsadug)
+library(scales)
+```
+
+# Create custom theme for graphs
+
+
+```{r}
+theme_new <- function(base_size = 16, base_family = "Helvetica"){
+  theme_bw(base_size = base_size, base_family = base_family) %+replace%
+    theme(
+      panel.grid = element_blank(),   
+      panel.border = element_rect(fill = NA, colour = "black", size=1),
+      panel.background = element_rect(fill = "white", colour = "black"), 
+      strip.background = element_rect(fill = NA),
+      axis.text.x = element_text(color = "black"),
+      axis.text.y = element_text(color = "black")
+      )
+}
+
+```
+
+
+# Functions to test robustness of model results
+
+## Step one: create formulas for all combinations of covariates + smoothing parameters
+
+Function steps described in the comments
+
+
+```{r}
+
+## Function that takes following inputs:
+## 1. one combination of covariates (can use w apply family 
+## to apply to all combinations of covariates)
+## 2. Vector of names of continuous control variables (ones eligible for smoother)
+## 3. Name of predictor of interest
+## 4. Name of outcome variable
+## 
+## General procedure: 
+## 1. Separate controls in that covariate in combination into
+## continuous controls (eligible for smoother) and other controls
+## (not eligible)
+## 2. Generate all combinations of continuous covariates to
+## be eligible for a smoother
+## 3. Place a smoother on continuous covariates in each
+## combination
+## 4. For continuous covariates not smoothed, add them back
+## to formula and also add option of smoothers on no
+## continuous covariates (might change code in combn to include 0?)
+## 5. Generate formulas that combine continuous covariates (if any)
+## with all smoothing combinations, non-continuous controls,
+## main predictor, and outcome
+## 
+## Returns: Formulas with all combinations of 
+## covariates (from input) and smoothers on continuous
+
+add_smoothers_tocombns <- function(covariate_combination,
+                                   all_continuous_controls,
+                                   predictor_ofinterest,
+                                   outcome){
+  
+  ## separate covariates into continuous and not continuous 
+  continuouscovars <- covariate_combination[covariate_combination %in%
+                                      all_continuous_controls]
+  notcontinuouscovars <- setdiff(covariate_combination, continuouscovars)
+  
+  
+  ## if there's at least one continuous covariate, execute
+  ## following code
+  if(length(continuouscovars) > 0){
+    
+    ## combn returns different format
+    ## when choosing from fewer than 3 
+    ## elements so reshape data in those cases
+    if(length(continuouscovars) == 1){
+      
+        continuouscovars_smoothcomb <- list(matrix(continuouscovars, ncol = 1))
+        continuouscovars_smoothcomb_s <- sprintf("s(%s)", continuouscovars) 
+        
+        
+        
+    } else if (length(continuouscovars) == 2){
+      
+        continuouscovars_smoothcomb <- list(matrix(c(continuouscovars[1],
+                                                 continuouscovars[2]),
+                                                 ncol = 2),
+                                          matrix(c(continuouscovars[1],
+                                                   continuouscovars[2]),
+                                                 ncol = 1)) 
+        continuouscovars_smoothcomb_s <- unlist(lapply(continuouscovars_smoothcomb,
+                         function(x) 
+                         apply(x, 2, function(y)
+                          paste(sprintf("s(%s)", y),
+                                collapse = "+"))))
+        
+    } else {
+      
+          continuouscovars_smoothcomb <- sapply(1:length(continuouscovars),
+                                       combn, x = continuouscovars)
+          
+          ## add s to those covariates to feed gam 
+          continuouscovars_smoothcomb_s <- unlist(lapply(continuouscovars_smoothcomb,
+                         function(x) 
+                         apply(x, 2, function(y)
+                          paste(sprintf("s(%s)", y),
+                                collapse = "+"))))
+        
+    }
+
+    ## find the continuous covariates that were not in each
+    ## combination of smoothing parameters
+    continuouscovars_notsmooth <- unlist(lapply(continuouscovars_smoothcomb,
+                    function(x) 
+                    apply(x, 2, 
+                    function(y) 
+                    paste(setdiff(continuouscovars,
+                              y), collapse = "+"))))
+    
+    ## combine into a single vector of continuous covariates
+    continuouscovars_all <-  ifelse(continuouscovars_notsmooth != "",
+                                    paste("+", paste(continuouscovars_smoothcomb_s,
+        continuouscovars_notsmooth[continuouscovars_notsmooth != ""],
+                                   sep = "+"), sep = ""),
+                                   paste("+",
+                                  continuouscovars_smoothcomb_s)) 
+    
+    ## add option of all the continuous covariates 
+    ## entering linearly into the model
+    continuouscovars_allpluslinear <- c(paste("+", paste(continuouscovars,
+                                              collapse = "+"), sep = ""),
+                                        continuouscovars_all) 
+  }
+  
+  ## then, return final formulas under three conditions:
+  ## 1. have both continuous covariates and non-continuous covariates
+  ## 2. have only continuous
+  ## 3. have only non-continuous
+  
+  ## condition one: both sets of covariates
+  if(length(continuouscovars) > 0 & 
+     length(notcontinuouscovars) > 0){
+        allcovars <- sprintf("%s+%s", continuouscovars_allpluslinear,
+                       paste(notcontinuouscovars, collapse = "+"))
+        allformulas_thatcolumn <- sapply(sprintf("%s ~ %s %s", 
+                                  outcome, 
+                                  predictor_ofinterest,
+                                  allcovars), formula) 
+        return(allformulas_thatcolumn)
+        
+  } else if(length(continuouscovars) > 0 & length(notcontinuouscovars) == 0){
+    
+     allformulas_thatcolumn <- sapply(sprintf("%s ~ %s %s", 
+                                  outcome, 
+                                  predictor_ofinterest,
+                                  continuouscovars_allpluslinear), formula) 
+     return(allformulas_thatcolumn)
+     
+  } else {
+    
+     allformulas_thatcolumn <- sapply(sprintf("%s ~ %s + %s",
+                                outcome,
+                                predictor_ofinterest,
+                                 paste(notcontinuouscovars, collapse = "+")), 
+                                formula) 
+     return(allformulas_thatcolumn)
+     
+  }
+}
+
+
+```
+
+
+
+
+## Step two: partition those formulas into fully linear, some smoothers/modeled non-linearities, smoother placed on all continuous covariates 
+
+
+```{r}
+
+
+indices_diffmodeltypes <- function(list_modelformulas,
+                                   coef_ofinterest_name,
+                                   all_continuous_controls){
+  
+  ## extract predictors included in each formula 
+  ## but removing the coefficient of interest
+  formulas_predictorsonly <- unlist(lapply(list_modelformulas,
+                              function(x) 
+                      gsub(sprintf("%s\\s+\\+\\s+", coef_ofinterest_name),
+                            "", as.character(x)[3]))) 
+  
+  ## returns indices of formulas with at least one non-linearity (based on
+  ## inclusion of at least one GAM smoothing term)
+  indices_anynonlinear <- grep("s\\(", 
+                                formulas_predictorsonly)
+  
+  ## returns indices of formulas with 0 non-linearities (difference between 
+  ## set of all indices and indices with at least one non-linearity)
+  indices_allLinear <- setdiff(1:length(list_modelformulas),
+                                indices_anynonlinear)
+  
+  ## returns indices of formulas with smoothers 
+  ## on all continuous covariates (not all covariates)
+  countsmoothers_strings <- str_count(formulas_predictorsonly,
+                                    "s\\(")
+  countcontinuouscovars_strings <- rowSums(sapply(all_continuous_controls, 
+                                                  str_count, 
+                                                  string = formulas_predictorsonly))
+  smoothers_tocontinuouscovars <- ifelse(countcontinuouscovars_strings == 0, 
+                                       1, #changed from 0 to one to include case of no continuous
+                                       countsmoothers_strings/countcontinuouscovars_strings) 
+  
+  formulas_allsmooth_values <- formulas_predictorsonly[smoothers_tocontinuouscovars == 1]
+  indices_allsmooth <- which(formulas_predictorsonly %in% formulas_allsmooth_values)
+  
+  ## package results in a named list and return
+  return(list(indices_anynonlinear = indices_anynonlinear,
+              indices_allLinear = indices_allLinear,
+              indices_allsmooth = indices_allsmooth))
+
+                                   }
+
+```
+
+
+## Step three: summarize model robustness for three types of formulas
+
+The first function takes in model objects from a generalized additive model (GAM), which allows for both fully linear models (models with no smoothing parameters, estimated parametrically) and models that incorporate smoothers.
+
+The second function takes in model objects from a standard linear model. 
+
+```{r}
+
+
+
+
+## function to summarize robustness (Table 3 and Table 5 in YH; takes GAM model
+## objects but can apply to formulas with all linear predictors to get
+## summary stats for fully linear models only)
+
+robustness_summarystat_gam <- function(results_allmodels, coef_ofinterest_name,
+                                       coef_ofinterest_value_basemodel){
+  
+  
+  ## later: maybe add error checking to give users 
+  ## warning if coefficient of interest isnt in the model results (e.g. a typo)
+  
+  
+  ## model summary statistics
+  SE_allmodels <- unlist(lapply(results_allmodels,
+                         function(x) summary(x)$se[coef_ofinterest_name])) 
+  sampling_SE <- sqrt(mean(SE_allmodels^2))
+  beta_allmodels <- unlist(lapply(results_allmodels,
+                         function(x) summary(x)$p.coeff[coef_ofinterest_name]))
+  mean_beta_allmodels <- mean(beta_allmodels)
+  mean_r2_allmodels <- mean(unlist(lapply(results_allmodels,
+                                function(x) summary(x)$r.sq)))
+  modeling_SE <- sqrt(mean((beta_allmodels - mean_beta_allmodels)^2))
+  total_SE <- sqrt(sampling_SE^2 + modeling_SE^2)
+  robustness_ratio <- mean(beta_allmodels)/total_SE
+  
+  ## coef sign related summary statistics
+  p_allmodels <- unlist(lapply(results_allmodels,
+                         function(x) summary(x)$p.pv[coef_ofinterest_name]))
+  positive_basemodelcoef <- as.vector(ifelse(coef_ofinterest_value_basemodel > 0, 1, 0))
+  sign_stability <- ifelse(positive_basemodelcoef == 1,
+                      sum(beta_allmodels > 0),
+                      sum(beta_allmodels < 0))/length(beta_allmodels)
+  significance_rate <- sum(p_allmodels < 0.05)/length(p_allmodels)
+  positive <- sum(beta_allmodels > 0)/length(beta_allmodels)
+  positive_andsig <- sum(p_allmodels < 0.05 & 
+                        beta_allmodels > 0)/length(p_allmodels) 
+  negative <- sum(beta_allmodels < 0)/length(beta_allmodels)
+  negative_andsig <- sum(p_allmodels < 0.05 & 
+                        beta_allmodels < 0)/length(p_allmodels) 
+
+    
+  ##return all   
+  return(data.frame(statistic = c("mean (b)", "Sampling SE",
+                                  "Modeling SE",
+                                  "Total SE",
+                                  "Robustness Ratio",
+                                  "Mean R-squared",
+                                  "Sign stability",
+                                  "Significance rate",
+                                  "Positive",
+                                  "Positive and sig.",
+                                  "Negative",
+                                  "Negative and sig."),
+                    value = c(mean_beta_allmodels,
+                              sampling_SE,
+                              modeling_SE,
+                              total_SE,
+                              robustness_ratio,
+                              mean_r2_allmodels,
+                              sign_stability,
+                              significance_rate,
+                              positive,
+                              positive_andsig,
+                              negative,
+                              negative_andsig)))
+}
+
+
+## parallel version for linear model
+robustness_summarystat_lm <- function(results_allmodels, coef_ofinterest_name,
+        coef_ofinterest_value_basemodel){
+
+  
+  ## model summary statistics
+  SE_allmodels <- unlist(lapply(results_allmodels,
+                         function(x) summary(x)$coefficients[coef_ofinterest_name, 2])) 
+  sampling_SE <- sqrt(mean(SE_allmodels^2))
+  beta_allmodels <- unlist(lapply(results_allmodels,
+                         function(x) 
+    coef(x)[coef_ofinterest_name]))
+  mean_beta_allmodels <- mean(beta_allmodels)
+  mean_r2_allmodels <- mean(unlist(lapply(results_allmodels,
+                        function(x) summary(x)$r.sq)))
+  modeling_SE <- sqrt(mean((beta_allmodels - mean_beta_allmodels)^2))
+  total_SE <- sqrt(sampling_SE^2 + modeling_SE^2)
+  robustness_ratio <- mean(beta_allmodels)/total_SE
+  
+  ## coef sign related summary statistics
+  p_allmodels <- unlist(lapply(results_allmodels,
+                         function(x) summary(x)$coefficients[coef_ofinterest_name, 4]))
+  positive_basemodelcoef <- as.vector(ifelse(coef_ofinterest_value_basemodel > 0, 1, 0))
+  sign_stability <- ifelse(positive_basemodelcoef == 1,
+                      sum(beta_allmodels > 0),
+                      sum(beta_allmodels < 0))/length(beta_allmodels)
+  significance_rate <- sum(p_allmodels < 0.05)/length(p_allmodels)
+  positive <- sum(beta_allmodels > 0)/length(beta_allmodels)
+  positive_andsig <- sum(p_allmodels < 0.05 & 
+                        beta_allmodels > 0)/length(p_allmodels) 
+  negative <- sum(beta_allmodels < 0)/length(beta_allmodels)
+  negative_andsig <- sum(p_allmodels < 0.05 & 
+                        beta_allmodels < 0)/length(p_allmodels) 
+
+    
+  ##return all   
+  return(data.frame(statistic = c("mean (b)", "Sampling SE",
+                                  "Modeling SE",
+                                  "Total SE",
+                                  "Robustness Ratio",
+                                  "Mean R-squared",
+                                  "Sign stability",
+                                  "Significance rate",
+                                  "Positive",
+                                  "Positive and sig.",
+                                  "Negative",
+                                  "Negative and sig."),
+                    value = c(mean_beta_allmodels,
+                              sampling_SE,
+                              modeling_SE,
+                              total_SE,
+                              robustness_ratio,
+                              mean_r2_allmodels,
+                              sign_stability,
+                              significance_rate,
+                              positive,
+                              positive_andsig,
+                              negative,
+                              negative_andsig)))
+}
+
+
+```
+
+```{r}
+
+##imbalance function
+density_function <- function(data, vars_of_interest,
+                             treatment,
+                             custom_legend_title,
+                             custom_colors){
+  ##restrict data to treatment + variables of interest
+  wide_data <- data[, c(treatment, vars_of_interest)]
+  
+  ##reshape to long format to use facet_wrap in 
+  ##plotting
+  data_long <- melt(wide_data, id.vars = treatment)
+
+  
+  ##plot with facet_wrap- subsetting inside
+  ##as.factor is again due to ggplot and strings
+  ggplot(data_long, aes(x = value)) +
+    geom_density(aes(fill = as.factor(data_long[[treatment]])), 
+                 alpha = 0.5) +
+    scale_fill_manual(values = custom_colors) +
+    facet_wrap(~ variable, scales = "free") +
+    theme_bw()  +
+    theme(legend.position = c(0.5, 0.25),
+          legend.background = element_blank()) +
+    theme_new() +
+    labs(fill = custom_legend_title)
+}
+
+
+
+
+
+
+
+
+
+```
+
+
+  
+## Code related to cross-validation
+
+One grounds that we might compare the same formula where all predictors are constrained to have linear relationships with the outcome versus formulas where predictors are allowed to vary exhibit non-linear relationships is comparing the out-of-sample $R^2$ of each set of formulas
+
+The following code, using one of the examples from the citation outlined above, uses n-fold cross-validation (applied with 5, generalizes to however many folds) to calculate this out-of-sample $R^2$
+
+```{r, eval = FALSE}
+## load packages
+library(gam)
+library(foreach)
+library(dplyr)
+
+## load clean data
+union <- read.csv("union_cleaned.csv",
+                  header= TRUE)
+
+union_forcv <- union %>%
+          mutate(union = ifelse(union == "union",
+                                1, 0))
+
+## load relevant objects
+smooth_formulas_union <- readRDS("unionformulas_allsmooth.RDS") 
+
+linear_formulas_union <- readRDS("unionformulas_allLinear.RDS") 
+
+smooth_formulas_union <- smooth_formulas_union[c(1:5)]
+linear_formulas_union <- linear_formulas_union[c(1:5)]
+
+## function that calculates CV R^2 
+## more manually without gamclass
+
+r2_allformulas <- function(formulas, 
+                  data, nfolds,
+                  outcomevar){
+  
+  ## generate separate folds 
+  ## for each model
+  folds <- split(sample(nrow(data)),
+               1:nfolds)
+  
+  ## generate matrix 
+  ## with predictions across
+  ## folds for each observation
+  predictions_test <- foreach(i = folds,
+                  .combine = cbind) %do% {
+        train_df <- data[-i, ] 
+        test_df <- data[i, ]
+        model_train <- gam(formulas,
+                data = train_df) 
+        test_pred <- rep(0, nrow(data))
+        test_pred[i] <- predict(model_train,
+                            test_df)
+        return(test_pred)
+                  }
+  cv_pred_values <- apply(predictions_test, 1, sum)
+  r2_oneformula <- cor(cv_pred_values, 
+               data[[outcomevar]])^2
+  return(r2_oneformula)
+                  }
+
+
+linear_r2_cv <- sapply(linear_formulas_union,
+               r2_allformulas,
+               data = union_forcv,
+               nfolds = 5,
+               outcomevar = "log_wage")
+print("obtained r^2 for linear specification")
+
+smooth_r2_cv <- sapply(smooth_formulas_union,
+               r2_allformulas,
+               data = union_forcv,
+               nfolds = 5,
+               outcomevar = "log_wage")
+  
+print("obtained r^2 for smooth specification")
+
+## save objects
+saveRDS(linear_r2_cv, "linear_r2.RDS")
+saveRDS(smooth_r2_cv, "smooth_r2.RDS")
+
+```
+  
+  
+
