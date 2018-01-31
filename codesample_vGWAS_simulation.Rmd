@@ -1,0 +1,1649 @@
+---
+title: "Code sample from vGWAS simulation"
+author: "Rebecca Johnson"
+date: "10/5/2017"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+The below sample contains code for the simulation component of the working paper on genetic contributions to variance that I discuss in the README file. 
+
+The code contains functions for:
+
+1. finding the sum of minor alleles for a particular SNP
+2. Iterating through sibling pairs and finding the within-pair mean of a trait
+3. Iterating through sibling pairs and finding the within-pair standard deviation of a trait
+4. Generating traits with four different types of confounding:
+
+1. No confounding
+2. Confounding on the mean of a trait
+3. Confounding on the variance of a trait
+4. Confounding on both the mean and variance of a trait
+
+5. Conducts power analysis that iterates through different sample sizes to see power to detect effect sizes of varying $R^2$ 
+
+
+
+## Load packages and functions
+
+```{r, message = FALSE, warning = FALSE}
+library(dplyr)
+library(abind)
+library(reshape2)
+library(caret)
+library(stats)
+library(stargazer)
+library(viridis)
+library(stringr)
+library(lme4)
+library(ade4)
+library(plm)
+library(scales)
+library(ggplot2)
+
+
+##function to convert 1, 2, 3 into factor variable
+##for what they correspond to, and relevel
+##so that reference category is major homozygotes
+recode_factor_allele <- function(variable){
+  return(factor(variable,
+                levels = c(1, 2, 3),
+                labels = c("min_h", "hz",
+                           "maj_h")))
+}
+
+##function to generalize summing minor alleles
+##across snps
+minorallele_sum <- function(snpname){
+  return(paste("2*", paste(snpname, "min_h_offspring1", sep = "_"),
+               "+", "2*", paste(snpname, "min_h_offspring2", sep = "_"),
+               "+", paste(snpname, "hz_offspring1", sep = "_"),
+               "+", paste(snpname, "hz_offspring2", sep = "_"),
+               sep = ""))
+}
+
+##function that you can feed a vector of traits (needs to
+##end in offspring) and will test sd of trait between offspring
+trait_sd_func <- function(pair, traitnames){
+  offspring1 <- paste(traitnames,
+                      "offspring1",
+                        sep = "_")
+  offspring2 <- paste(traitnames,
+                "offspring2",
+                sep = "_")
+  return(sd(c(pair[[offspring1]],
+                 pair[[offspring2]])))
+}
+
+trait_mean_func <- function(pair, traitnames){
+  offspring1 <- paste(traitnames,
+                      "offspring1",
+                        sep = "_")
+  offspring2 <- paste(traitnames,
+                "offspring2",
+                sep = "_")
+  return(mean(c(pair[[offspring1]],
+                 pair[[offspring2]])))
+}
+
+
+## add theme to use for graphs
+
+theme_new <- function(base_size = 16, base_family = "Helvetica"){
+  theme_bw(base_size = base_size, base_family = base_family) %+replace%
+    theme(
+      panel.grid = element_blank(),   
+      panel.border = element_rect(fill = NA, colour = "black", size=1),
+      panel.background = element_rect(fill = "white", colour = "black"), 
+      strip.background = element_rect(fill = NA),
+      axis.text.x = element_text(color = "black"),
+      axis.text.y = element_text(color = "black")
+      )
+}
+
+
+
+##set seed 
+##rgnseed <- sample(1:100000, 1)
+set.seed(53533)
+
+```
+
+
+## Generate genotypes of offspring and parents using famsim method
+
+(Took code for the relevant part of generating genotypes out of function in simfam.R file)
+
+```{r}
+
+##arguments relevant for genotype generation
+##(subset of overall arguments)
+# ARGUMENTS
+# N			number of families per subpopulation
+# s			number of subpopulations (assumes equal representation of each subpopulation)
+# pmin		lower bound of uniform distribution from which ancestral allele frequency is 
+# drawn (default = 0.1 as per Price et al. 2006 and Wu et al. 2011)
+# pmax		upper bound of uniform distribution from which ancestral allele frequency is 
+# drawn (default = 0.9 as per Price et al. 2006 and Wu et al. 2011)
+# Lu		number of SNP loci unassociated with the phenotype (assumed to be unlinked to 
+# each other and to trait-associated SNPs)
+# c			extent (in the sense of variance) to which each subpopulation differs in allele
+# frequency of SNPs from typical values (akin to F_ST) (default = 0.01 as per Price et 
+# al. 2006 and Wu et al. 2011)
+# Lc		number of SNP loci associated with the mean value of the phenotype (assumed to
+# be unlinked to each other and to other classes of SNPs)
+# Lcv		number of SNP loci associated with the variance of the phenotype (assumed to 
+# be unlinked to each other and to other classes of SNPs)
+# o			number of offspring per family (default = 2 [quartets])
+
+##Setting values for those arguments
+
+###number of snp's (just did two total, since 
+###Cao method for generating phenotype 
+### from genotype just uses all snps as 
+### causal but generates different outcome variables)
+Lu <- 2 
+Lc <- 2
+Lcv <- 2
+
+###number of families per subpopulation (to simplify,
+### just did one subpopulation and 500 families)
+### and number of offspring per family
+N <- 1000
+s <- 4
+o <- 2
+
+###range for uniform distribution to generate
+###probability of allele A v. G, etc. at locus
+###took from parameter values set in other simulation
+pmin=0.1
+pmax=0.9
+
+### c parameter of subpopulations differing in variance 
+###(not relevant for present parameter values since only 
+### 1 subpop)
+c=0.01
+
+# STEP 1: Generate genotypes of parent generation
+L <- Lu + Lc + Lcv                 # total number of SNPs (unassociated, causal
+# for mean value, causal for variance)
+f <- N*s                           # total number of families
+
+# allele frequencies in ancestral population (drawn from uniform[pmin,pmax] distribution 
+# as per Price et al. 2006 and Wu et al. 2011 who used [0.1,0.9])
+p <- runif(L,min=pmin,max=pmax)    
+p2 <- rbind(p,1-p)                 # need to specify frequency of each allele
+
+# generate parent genotypes (ac=2 for 2 alleles/locus, beta parameter not given
+# because allele frequencies given)
+parents <- simMD(N*2,s,L,p=p2,c.vec1=rep(c,s),ac=2) - 1 
+
+###rj additional notes: L-length array (separate matrix for each snp)
+###each element in the array is a 100 x 2 matrix (first column = 
+### indicator for 1 allele; second column = indicator for second allele)
+### (rows = ## of families x 2, so for instance, row 1:2 = family 1;
+### row 3:4 = family 2 etc)
+### look at one snp for example of structure
+snp1 <- parents[,, 1]
+
+# returns f*2 X 2 (diploid) X L matrix of parent genotypes [SNPs 1 to Lu = 
+# unassociated, Lu+1 to Lu+Lc = causal for mean, Lu+Lc+1 to Lu+Lc+Lcv = causal for 
+# variance]
+# original output is 1 or 2 for allele names; changed to 0 or 1 by subtracting 1
+
+# rearrange to 2-D matrix where columns are loci and rows go: parent 1 allele 1,
+# parent 1 allele 2, parent 2 allele 1, etc [parents 1+2 same family, 
+# 3+4 same family, etc]
+parents2 <- matrix(aperm(parents,c(2,1,3)),nrow=2*2*f)  
+
+### rj notes: above binds the 7 different matrices stored in the array into 
+### one large matrix where columns are alleles and rows represent parents
+
+# parent genotypes of causal SNPs as 1=AA, 2=AB, 3=BB (used for determining phenotypes)   
+parentsC <- parents2[seq(1,2*f*2,by=2),(Lu+1):L] + 
+parents2[seq(2,2*f*2,by=2),(Lu+1):L] + 1 
+
+
+### rj notes: above just subsets to causal snps (5 out of the 7 in this case,
+### on either mean or variance, and for those causal snp's, adds the alleles of 2 
+### parents to create genotype)
+
+# STEP 2: Generate genotypes of offspring assuming random mating and independent segregation
+# f*o*2 X L matrix of offspring genotypes [same row structure as parents2 but instead of just 2 parents per family have o offspring per family]
+offspring <- matrix(parents2[cbind((runif(2*f*o*L)<0.5) + rep(rep(seq(1,(f-1)*2*2+1,by=2*2),each=2*o),L) + rep(c(0,2),f*o*L),rep(seq(1:L),each=2*f*o))],nrow=2*f*o)  
+
+# offspring genotypes of causal SNPs as 1=AA, 2=AB, 3=BB (used for determining phenotypes)
+offspringC <- offspring[seq(1,2*f*o,by=2),(Lu+1):L] + 
+  offspring[seq(2,2*f*o,by=2),(Lu+1):L] + 1 
+
+
+
+```
+
+## Transform genotypes of offspring into data structure similar to Cao
+
+```{r}
+##turn into df
+offspring_df_4_Cao <- as.data.frame(offspringC)
+
+##name columns with snps
+colnames(offspring_df_4_Cao) <- paste("snp", seq(1, Lc+ Lcv, by = 1), sep = "")
+
+##add individual ID's and family ID
+offspring_df_4_Cao <- offspring_df_4_Cao %>%
+              mutate(IID = seq(from = 1, to = N*s*o,
+                               by = 1),
+                     FID = rep(seq(from = 1, to = N*s,
+                               by = 1), 
+                              each = o),
+                     subpop = rep(seq(from = 1, to = s,
+                                   by = 1), 
+                               each = N*o)) 
+
+
+##function to convert 1, 2, 3 into factor variable
+##for what they correspond to, and relevel
+##so that reference category is major homozygotes
+recode_factor_allele <- function(variable){
+  return(factor(variable,
+         levels = c(1, 2, 3),
+         labels = c("min_h", "hz",
+                    "maj_h")))
+}
+
+offspring_factor_alleles <- apply(offspring_df_4_Cao[, grepl("snp",
+                                     colnames(offspring_df_4_Cao))],
+                        2, recode_factor_allele) 
+
+##use function for ade4
+indic_snps <- acm.disjonctif(offspring_factor_alleles)
+colnames(indic_snps) <- paste(rep(grep("snp", 
+                        colnames(offspring_df_4_Cao), 
+                        value = TRUE),
+                        each = 3),
+                  gsub("^\\.", "", colnames(indic_snps)),
+                  sep = "_")
+indic_snps_df <- cbind.data.frame(offspring_df_4_Cao[,
+                                  c("FID", "IID", "subpop")],
+                                  indic_snps)
+##for now, generate simulated sex and age
+##since used as covariates in their phenotype generation
+##step
+gendf <- indic_snps_df %>%
+        mutate(sex = sample(c(rep(0, (N*s*o)/2),
+                                      rep(1, (N*s*o)/2)),
+                                    N*s*o, replace = FALSE),
+                    age = rnorm(N*s*o, mean = 50, sd = 10))
+
+
+```
+
+## Merge in parent count of minor alleles for each snp
+
+```{r}
+parent_df <- as.data.frame(parentsC)
+
+##name columns with snps
+colnames(parent_df) <- paste("snp", seq(1, Lc+ Lcv, by = 1), 
+                            sep = "")
+
+##add individual ID's and family ID
+parent_df <- parent_df %>%
+              mutate(IID = seq(from = 1, to = N*s*o,
+                               by = 1),
+                     FID = rep(seq(from = 1, to = N*s,
+                               by = 1), 
+                              each = 2),
+                     subpop = rep(seq(from = 1, to = s,
+                                   by = 1), 
+                               each = N*o))
+
+
+##obtain minor allele count of parents for each family ID
+
+##right now, parentsC coded as 1 = AA, 2 = AB, 3 = BB
+##recode so that 2 = AA, 1 = AB, and 0 = BB to make
+##summing across both parents easier
+parent_df_minor_recode <- parent_df %>%
+        mutate_if(grepl("snp", names(.)),
+                  funs (ifelse(. == 1, 
+                               2, 
+                        ifelse(. == 2, 
+                               1, 0))))
+
+parent_sum_minor <- parent_df_minor_recode %>%
+              group_by(FID) %>%
+              summarize_at(contains("snp"),
+                           sum) %>%
+              dplyr::select(-IID, -subpop)
+colnames(parent_sum_minor) <- ifelse(grepl("snp",
+                            colnames(parent_sum_minor)),
+                            paste(colnames(parent_sum_minor),
+                                  "minorcount_parents",
+                                  sep = "_"),
+                            colnames(parent_sum_minor)) 
+              
+##sample one snp and one parent to check
+##if more manual way works
+sample_snp <- sample(grep("snp",
+                          colnames(parent_df),
+                          value = TRUE), 1) 
+sample_parent <- sample(parent_df$FID, 1)
+
+
+##draw two parents and sum based on main data
+sample_sumcount <- sum(parent_df_minor_recode[parent_df$FID == sample_parent, 
+                                              sample_snp])
+
+identical(sample_sumcount, as.data.frame(parent_sum_minor)[
+              parent_sum_minor$FID == sample_parent,
+              paste(sample_snp, "minorcount_parents", sep = "_")])
+
+
+
+##merge with offspring genotype- each offspring
+##in a family will have same count of parental minor alleles
+gendf_withparents <- merge(gendf, parent_sum_minor,
+                          by = "FID")
+
+
+```
+
+## Merge in intercept for family to add unobserved family-level confounder to outcome (but not directly estimated in equation)
+
+
+```{r}
+# create vector of sibling count of alleles for snp1
+snp1_siblingcount <- gendf %>%
+                   group_by(factor(FID)) %>%
+                  summarise(snpcount = sum(2 * snp1_min_h +
+                                          snp1_hz))
+snp1_siblingcount_vec <- as.vector(snp1_siblingcount$snpcount)
+
+##get correlated family intercept using
+##general cholesky decomposition method 
+##used in samfim where we first generate
+##a non-correalted intercept with mean = 0, sd = 1
+##(startingintercept) and then scale
+##by cholesky decomp of correlation matrix
+##to get new intercept correlated with snp1
+##minor allele count
+rho <- 0.3
+cor_mat <- matrix(rho, nrow = 2, ncol = 2)
+diag(cor_mat) <- 1
+cholesky_cor_mat <- chol(cor_mat)
+startingintercept <- rnorm(f)
+startingintercept_sibcount <- cbind(snp1_siblingcount_vec,
+                                     startingintercept)
+##induce correlation using the cholesky decomp
+correlatedintercept_sibcount <- startingintercept_sibcount %*% 
+                              cholesky_cor_mat
+
+
+gendf_withparents <- gendf_withparents %>%
+              mutate(family_intercept = rep(correlatedintercept_sibcount[, 2],
+                                            each = o))
+
+
+```
+
+## Generate normally-distributed phenotypes with mean effects, var effects, both, neither
+
+See document for outline explaining generation of mean and variance effects
+
+For now, just generating for snp1 but can repeat with other snps
+
+Depart from Cao in generating two versions:
+
+\begin{enumerate}
+\item One without family-level confounder 
+\item One with family level confounder: adds the \textit{family\_intercept} term generated above to outcome variable
+\end{enumerate}
+
+
+```{r}
+
+gendf_withparents <- gendf_withparents %>%
+        mutate(base_outcome = 0.5 * sex + 0.05 * age,
+               
+               ##neither mean nor variance effects
+               normal_neithereffect_eithersnp = base_outcome +
+                 rnorm(N*s*o, mean = 0, sd = 1),
+              
+               ##mean effects but not variance effects
+               normal_meaneffect_snp1 = base_outcome + 
+                 0.35*snp1_min_h + 0.15*snp1_hz +
+                 rnorm(N*s*o, mean = 0, sd = 1),
+               
+               ##variance effects but not mean effects
+              normal_vareffect_snp1 = base_outcome +
+                    ifelse(snp1_min_h == 1,
+                      rnorm(nrow(gendf[gendf$snp1_min_h == 1, ]), 
+                      mean = 0, sd = 1.4),
+                      ifelse(snp1_hz == 1,
+                      rnorm(nrow(gendf[gendf$snp1_hz == 1, ]), mean = 0, 
+                            sd = 1.15),
+                      rnorm(nrow(gendf[gendf$snp1_maj_h == 1, ]), mean = 0, 
+                            sd = 1))),
+              
+              ##mean and variance effects
+              normal_meanvareffect_snp1 = base_outcome +
+                0.35*snp1_min_h + 0.15*snp1_hz + 
+                ifelse(snp1_min_h == 1,
+                      rnorm(nrow(gendf[gendf$snp1_min_h == 1, ]), 
+                      mean = 0, sd = 1.4),
+                      ifelse(snp1_hz == 1,
+                      rnorm(nrow(gendf[gendf$snp1_hz == 1, ]), mean = 0, 
+                            sd = 1.15),
+                      rnorm(nrow(gendf[gendf$snp1_maj_h == 1, ]), mean = 0, 
+                            sd = 1))),
+              
+              ##repeating with family-level confounder
+              base_outcome_withconfound = 0.5 * sex + 0.05 * age +
+                family_intercept,
+              
+             ##neither mean nor variance effects
+              normal_neithereffect_eithersnp_confounded = base_outcome_withconfound +
+                 rnorm(N*s*o, mean = 0, sd = 1),
+              
+               ##mean effects but not variance effects
+               normal_meaneffect_snp1_confounded = base_outcome_withconfound + 
+                 0.35*snp1_min_h + 0.15*snp1_hz +
+                 rnorm(N*s*o, mean = 0, sd = 1),
+               
+               ##variance effects but not mean effects
+              normal_vareffect_snp1_confounded = base_outcome_withconfound +
+                    ifelse(snp1_min_h == 1,
+                      rnorm(nrow(gendf[gendf$snp1_min_h == 1, ]), 
+                      mean = 0, sd = 1.4),
+                      ifelse(snp1_hz == 1,
+                      rnorm(nrow(gendf[gendf$snp1_hz == 1, ]), mean = 0, 
+                            sd = 1.15),
+                      rnorm(nrow(gendf[gendf$snp1_maj_h == 1, ]), mean = 0, 
+                            sd = 1))),
+              
+              ##mean and variance effects
+              normal_meanvareffect_snp1_confounded = base_outcome_withconfound +
+                0.35*snp1_min_h + 0.15*snp1_hz + 
+                ifelse(snp1_min_h == 1,
+                      rnorm(nrow(gendf[gendf$snp1_min_h == 1, ]), 
+                      mean = 0, sd = 1.4),
+                      ifelse(snp1_hz == 1,
+                      rnorm(nrow(gendf[gendf$snp1_hz == 1, ]), mean = 0, 
+                            sd = 1.15),
+                      rnorm(nrow(gendf[gendf$snp1_maj_h == 1, ]), mean = 0, 
+                            sd = 1)))) 
+             
+              
+
+```
+
+## For each sibling pair, generate minor allele count and standard deviation in outcomes
+
+```{r}
+##to construct count and SD, reshape to wide format
+##where rather than each offspring having a separate
+##row, each family has one row with offspring in different columns
+gendf_4_wide <- gendf_withparents %>%
+          mutate(offspringID = paste("offspring", 
+                                  rep(seq(from = 1, to = o,
+                                   by =1 ), times = N*s), sep = "")) %>%
+          dplyr::select(-IID)
+gendf_wide <- reshape(gendf_4_wide,
+                      idvar = c("FID", "subpop", 
+                              grep("minorcount_parents",
+                                   colnames(gendf_4_wide),
+                                   value = TRUE)),
+                      timevar = "offspringID", 
+                      direction = "wide",
+                      sep = "_")
+
+
+##create function to generalize summing minor alleles
+##across snps
+minorallele_sum <- function(snpname){
+  return(paste("2*", paste(snpname, "min_h_offspring1", sep = "_"),
+              "+", "2*", paste(snpname, "min_h_offspring2", sep = "_"),
+              "+", paste(snpname, "hz_offspring1", sep = "_"),
+              "+", paste(snpname, "hz_offspring2", sep = "_"),
+                      sep = ""))
+}
+
+
+##create vector of snp names
+##going from snp1 to snp_n where 
+## n = total causal snps set above
+snps <- paste("snp", seq(from = 1, to = (Lc + Lcv), by = 1), 
+            sep = "")
+
+##use sapply to create formulas for each fo those snps
+minorallele_eachsnp <- sapply(snps, minorallele_sum)
+
+trait_names <- grep("effect", colnames(gendf_wide), value = TRUE)
+
+##add minor allele count variables to wide format data
+gendf_wide <- gendf_wide %>%
+        mutate_(snp1_minorcount = minorallele_eachsnp[1],
+               snp2_minorcount = minorallele_eachsnp[2],
+               snp3_minorcount = minorallele_eachsnp[3],
+               snp4_minorcount = minorallele_eachsnp[4])
+
+
+##create trait names
+trait_names <- gsub("\\_offspring[1-2]", "", 
+                grep("effect", colnames(gendf_wide), 
+                value = TRUE))
+
+
+##calculate for one set of obs
+sd_alltraits_traitcol <- t(apply(gendf_wide, 1,
+                       function(x) sapply(unique(trait_names),
+                                          trait_sd_func, 
+                                          pair = x)))
+colnames(sd_alltraits_traitcol) <- paste(unique(trait_names),
+                              "siblingsd", sep = "_") 
+
+
+##to make sure the above function worked, randomly
+##sampling sibling pair and trait and check to see if 
+##corresponds
+sample_trait <- sample(trait_names, 1)
+sample_pair <- sample(1:nrow(gendf_wide), 1)
+sample_pair_sd <- sd(c(gendf_wide[sample_pair, paste(sample_trait,
+                                  "offspring1", sep = "_")],
+                       gendf_wide[sample_pair, paste(sample_trait,
+                                  "offspring2", sep = "_")])) 
+identical(sample_pair_sd, as.data.frame(sd_alltraits_traitcol)[sample_pair,
+                          paste(sample_trait, "siblingsd", sep = "_")])
+
+##run similar process for mean of each trait
+mean_alltraits_traitcol <- t(apply(gendf_wide, 1,
+                       function(x) sapply(unique(trait_names),
+                                          trait_mean_func, 
+                                          pair = x)))
+colnames(mean_alltraits_traitcol) <- paste(unique(trait_names),
+                              "siblingmean", sep = "_") 
+
+##create data.frame of gendef_wide_withtraits
+##to use for analyses
+gendf_wide_withtraits <- cbind.data.frame(gendf_wide,
+                  sd_alltraits_traitcol, mean_alltraits_traitcol) 
+
+
+```
+
+
+### Results with one replicate
+
+## For now, see if minor allele count method picks up variance effects
+
+Model with no controls; results for one replicate
+
+All models control for sibling mean of that trait
+
+```{r}
+##base formula for predictors
+reg_predictors <- paste(c("snp1_minorcount",
+          "sex_offspring1", "age_offspring1",
+          "sex_offspring2", "age_offspring2"), 
+          collapse = "+")
+reg_predictors_parents <- paste(c("snp1_minorcount",
+          "snp1_minorcount_parents",
+          "sex_offspring1", "age_offspring1",
+          "sex_offspring2", "age_offspring2"),
+          collapse = "+") 
+          
+##regression for outcome with mean effects- should not be significant
+no_effect <- lm(paste(paste("normal_neithereffect_eithersnp_siblingsd",
+                reg_predictors, sep = "~"),
+                "normal_neithereffect_eithersnp_siblingmean", sep = "+"),
+           data = gendf_wide_withtraits)
+
+##regression for outcome with mean effects- should not be significant
+mean_effect <- lm(paste(paste("normal_meaneffect_snp1_siblingsd",
+                  reg_predictors, sep = "~"),
+                  "normal_meaneffect_snp1_siblingmean",
+                  sep = "+"),
+           data = gendf_wide_withtraits) 
+
+##regression for outcome with var effects- should be significant
+var_effect <- lm(paste(paste("normal_vareffect_snp1_siblingsd",
+             reg_predictors, sep = "~"),
+             "normal_vareffect_snp1_siblingmean",
+             sep  = "+"),
+           data = gendf_wide_withtraits)
+
+##regression for outcome with var and mean effects- should be significant
+meanandvar_effect <- lm(paste(paste("normal_meanvareffect_snp1_siblingsd",
+              reg_predictors, sep = "~"),
+              "normal_meanvareffect_snp1_siblingmean", 
+              sep = "+"),
+           data = gendf_wide_withtraits)
+
+
+##repeat for parents
+no_effect_parentcontrol <- lm(paste(paste("normal_neithereffect_eithersnp_siblingsd",
+                reg_predictors_parents, sep = "~"),
+                "normal_neithereffect_eithersnp_siblingmean", sep = "+"),
+           data = gendf_wide_withtraits)
+
+##regression for outcome with mean effects- should not be significant
+mean_effect_parentcontrol <- lm(paste(paste("normal_meaneffect_snp1_siblingsd",
+                  reg_predictors_parents, sep = "~"),
+                  "normal_meaneffect_snp1_siblingmean",
+                  sep = "+"),
+           data = gendf_wide_withtraits) 
+
+##regression for outcome with var effects- should be significant
+var_effect_parentcontrol <- lm(paste(paste("normal_vareffect_snp1_siblingsd",
+             reg_predictors_parents, sep = "~"),
+             "normal_vareffect_snp1_siblingmean",
+             sep  = "+"),
+           data = gendf_wide_withtraits)
+  
+##regression for outcome with var and mean effects- should be significant
+meanandvar_effect_parentcontrol <- lm(paste(paste("normal_meanvareffect_snp1_siblingsd",
+              reg_predictors_parents, sep = "~"),
+              "normal_meanvareffect_snp1_siblingmean", 
+              sep = "+"),
+           data = gendf_wide_withtraits)
+
+```
+
+## Run regressions for same versions of outcome variables but ones confounded by family-level effects
+
+```{r}
+##repeat above but for outcomes confounded by family-level effects
+no_effect_confounded <- lm(paste(paste("normal_neithereffect_eithersnp_confounded_siblingsd",
+                reg_predictors, sep = "~"),
+                "normal_neithereffect_eithersnp_confounded_siblingmean", sep = "+"),
+           data = gendf_wide_withtraits)
+
+##regression for outcome with mean effects- should not be significant
+mean_effect_confounded <- lm(paste(paste("normal_meaneffect_snp1_confounded_siblingsd",
+                  reg_predictors, sep = "~"),
+                  "normal_meaneffect_snp1_confounded_siblingmean",
+                  sep = "+"),
+           data = gendf_wide_withtraits) 
+
+##regression for outcome with var effects- should be significant
+var_effect_confounded <- lm(paste(paste("normal_vareffect_snp1_confounded_siblingsd",
+             reg_predictors, sep = "~"),
+             "normal_vareffect_snp1_confounded_siblingmean",
+             sep  = "+"),
+           data = gendf_wide_withtraits)
+
+##regression for outcome with var and mean effects- should be significant
+meanandvar_effect_confounded <- lm(paste(paste("normal_meanvareffect_snp1_confounded_siblingsd",
+              reg_predictors, sep = "~"),
+              "normal_meanvareffect_snp1_confounded_siblingmean", 
+              sep = "+"),
+           data = gendf_wide_withtraits)
+
+
+##repeat w. control for parent genotype
+no_effect_parents_confounded <- lm(paste(paste("normal_neithereffect_eithersnp_confounded_siblingsd",
+                reg_predictors_parents, sep = "~"),
+                "normal_neithereffect_eithersnp_confounded_siblingmean", sep = "+"),
+           data = gendf_wide_withtraits)
+
+##regression for outcome with mean effects- should not be significant
+mean_effect_parents_confounded <- lm(paste(paste("normal_meaneffect_snp1_confounded_siblingsd",
+                  reg_predictors_parents, sep = "~"),
+                  "normal_meaneffect_snp1_confounded_siblingmean",
+                  sep = "+"),
+           data = gendf_wide_withtraits) 
+
+##regression for outcome with var effects- should be significant
+var_effect_parents_confounded <- lm(paste(paste("normal_vareffect_snp1_confounded_siblingsd",
+             reg_predictors_parents, sep = "~"),
+             "normal_vareffect_snp1_confounded_siblingmean",
+             sep  = "+"),
+           data = gendf_wide_withtraits)
+
+##regression for outcome with var and mean effects- should be significant
+meanandvar_effect_parents_confounded <- lm(paste(paste("normal_meanvareffect_snp1_confounded_siblingsd",
+              reg_predictors_parents, sep = "~"),
+              "normal_meanvareffect_snp1_confounded_siblingmean", 
+              sep = "+"),
+           data = gendf_wide_withtraits)
+
+```
+
+```{r, results = "hide", echo = FALSE, message = FALSE}
+stargazer(no_effect, mean_effect, var_effect,
+          meanandvar_effect, 
+          no_effect_confounded,
+          mean_effect_confounded,
+          var_effect_confounded,
+          meanandvar_effect_confounded,
+          report = "vcsp*",
+          dep.var.labels = c("No effect: no family confounder",
+                             "Mean effect: no family confounder",
+                             "Var effect: no family confounder",
+                             "Var and mean effect: no family confounder",
+                             "No effect: family confounder",
+                             "Mean effect: family confounder",
+                             "Var effect: family confounder",
+                             "Var and mean effect: family confounder"),
+          title = "Model: no parent genotype controls")
+
+stargazer(no_effect_parentcontrol, mean_effect_parentcontrol, 
+          var_effect_parentcontrol,
+          meanandvar_effect_parentcontrol,
+          no_effect_parents_confounded, mean_effect_parents_confounded, 
+          var_effect_parents_confounded,
+          meanandvar_effect_parents_confounded,
+          report = "vcsp*",
+          dep.var.labels = c("No effect: no family confounder",
+                             "Mean effect: no family confounder",
+                             "Var effect: no family confounder",
+                             "Var and mean effect: no family confounder",
+                             "No effect: family confounder",
+                             "Mean effect: family confounder",
+                             "Var effect: family confounder",
+                             "Var and mean effect: family confounder"),
+          title = "Model: parent genotype controls")
+
+```
+
+### Plot bivariate results
+
+```{r}
+meanandci_simulatedDV <- gendf_wide_withtraits %>%
+          group_by(factor(snp1_minorcount)) %>%
+          summarise(meansd_noeffects = mean(normal_neithereffect_eithersnp_siblingsd),
+                    meansd_varianceoutcome = mean(normal_vareffect_snp1_siblingsd),
+                    meansd_meanoutcome = mean(normal_meaneffect_snp1_siblingsd),
+                    meansd_varmeanoutcome = mean(normal_meanvareffect_snp1_siblingsd),
+                    se_noeffects = sd(normal_neithereffect_eithersnp_siblingsd)/
+                      sqrt(nrow(gendf_wide_withtraits)),
+                    se_varianceoutcome = sd(normal_vareffect_snp1_siblingsd)/
+                      sqrt(nrow(gendf_wide_withtraits)),
+                    se_meanoutcome = sd(normal_meaneffect_snp1_siblingsd)/
+                      sqrt(nrow(gendf_wide_withtraits)),
+                    se_varmeanoutcome = sd(normal_meanvareffect_snp1_siblingsd)/
+                      sqrt(nrow(gendf_wide_withtraits)))
+colnames(meanandci_simulatedDV)[1] <- "snp1_minorcount"
+meanandci_simulatedDV_forplot <- meanandci_simulatedDV %>%
+                            reshape2::melt(id.vars = "snp1_minorcount") %>%
+                            mutate(parameter = gsub("\\_.*", "", 
+                                                    variable),
+                                   simulatedDV = gsub(".*\\_",
+                                                      "",
+                                                      variable)) %>%
+                            dplyr::select(-variable) %>%
+                            reshape(, idvar = c("snp1_minorcount",
+                                                "simulatedDV"),
+                                    timevar = "parameter",
+                                    direction = "wide",
+                                    sep = "_") %>%
+                            mutate(lowerci = value_meansd - 1.96*value_se,
+                                   upperci = value_meansd + 1.96 *value_se)
+meanandci <- ggplot(meanandci_simulatedDV_forplot, 
+       aes(x = snp1_minorcount,
+                      y = value_meansd,
+       color = factor(simulatedDV,
+                  levels = c("noeffects", "meanoutcome",
+                             "varianceoutcome", "varmeanoutcome"),
+                  labels = c("snp has no effect",
+                             "snp affects mean only",
+                             "snp affects variance only",
+                             "snp affects mean and variance")),
+       group = factor(simulatedDV))) +
+  geom_point(position = "dodge") +
+  geom_line() +
+  geom_errorbar(aes(ymin = lowerci, ymax = upperci, width = 0.1)) +
+  xlab("Sibling count of minor alleles") +
+  ylab("Sibling standard \n deviation of outcome \n (non-adjusted mean and 95% CI)") +
+  labs(color = "Type of simulated outcome") +
+  theme_bw(base_size = 16) +
+  ylim(0.5, 1.5) +
+  theme(legend.position = c(0.25, 0.75),
+        legend.background = element_blank()) +
+  scale_color_brewer(type = "qual", palette = 2)
+
+ggsave("../finalfigures/meanandci_vareffects.pdf",
+       plot = last_plot(),
+       device = "pdf")
+
+```
+
+
+
+
+### Updated power analysis
+
+
+```{r}
+library("pwr")
+
+## first replicate power analysis run in paper
+
+## iterated through r^2 of putative effect up to point 1
+## for ukb, only looked at full siblings and got 
+## N from folliwng link: https://www.biorxiv.org/content/biorxiv/early/2017/07/20/166298.full.pdf
+## for addhealth, got from parenting memo in biosoc 
+## doc
+r2_pwranalysis <- seq(0, 0.1, by = 0.001)
+n_pairlevel_FHS <- 583
+n_pairlevel_addhealth <- 852
+n_pairlevel_ukb <- 22666 
+n_total <- n_pairlevel * 2
+stringent_sig <- 0.00001
+looser_sig <- 0.05 
+
+
+## turn R2 into f2
+f2_pwranalysis <- r2_pwranalysis/(1 - r2_pwranalysis)
+
+## apply to each combination of sample sizes
+pwr_FHS_stringent <- lapply(f2_pwranalysis,
+            pwr.f2.test,
+            u = 2, v = n_pairlevel_FHS - 2 -1, 
+            sig.level = stringent_sig,
+            power = NULL)
+pwr_addH_stringent <- lapply(f2_pwranalysis,
+            pwr.f2.test,
+            u = 2, v = n_pairlevel_addhealth - 2 -1, 
+            sig.level = stringent_sig,
+            power = NULL)
+pwr_ukb_stringent <- lapply(f2_pwranalysis,
+            pwr.f2.test,
+            u = 2, v = n_pairlevel_ukb - 2 -1, 
+            sig.level = stringent_sig,
+            power = NULL)
+           
+
+## get pwr from all
+pwr_FHS_stringent_df <- data.frame(r2 = r2_pwranalysis,
+                                   power = unlist(lapply(pwr_FHS_stringent,
+                                                  function(x) x$power)),
+                                   sig = stringent_sig,
+                                   siblingpairs = n_pairlevel_FHS)
+pwr_addh_stringent_df <- data.frame(r2 = r2_pwranalysis,
+                                   power = unlist(lapply(pwr_addH_stringent,
+                                                  function(x) x$power)),
+                                   sig = stringent_sig,
+                                   siblingpairs = n_pairlevel_addhealth)
+pwr_ukb_stringent_df <- data.frame(r2 = r2_pwranalysis,
+                                   power = unlist(lapply(pwr_ukb_stringent,
+                                                  function(x) x$power)),
+                                   sig = stringent_sig,
+                                   siblingpairs = n_pairlevel_ukb)
+
+
+## repeat with less stringent p-value threshold
+pwr_FHS_replication <- lapply(f2_pwranalysis,
+            pwr.f2.test,
+            u = 2, v = n_pairlevel_FHS - 2 -1, 
+            sig.level = looser_sig,
+            power = NULL)
+pwr_addH_replication <- lapply(f2_pwranalysis,
+            pwr.f2.test,
+            u = 2, v = n_pairlevel_addhealth - 2 -1, 
+            sig.level = looser_sig,
+            power = NULL)
+pwr_ukb_replication <- lapply(f2_pwranalysis,
+            pwr.f2.test,
+            u = 2, v = n_pairlevel_ukb - 2 -1, 
+            sig.level = looser_sig,
+            power = NULL)
+
+
+## create df
+pwr_FHS_replication_df <- data.frame(r2 = r2_pwranalysis,
+                                   power = unlist(lapply(pwr_FHS_replication,
+                                                  function(x) x$power)),
+                                   sig = looser_sig,
+                                   siblingpairs = n_pairlevel_FHS)
+pwr_addh_replication_df <- data.frame(r2 = r2_pwranalysis,
+                                   power = unlist(lapply(pwr_addH_replication,
+                                                  function(x) x$power)),
+                                   sig = looser_sig,
+                                   siblingpairs = n_pairlevel_addhealth)
+pwr_ukb_replication_df <- data.frame(r2 = r2_pwranalysis,
+                                   power = unlist(lapply(pwr_ukb_replication,
+                                                  function(x) x$power)),
+                                   sig = looser_sig,
+                                   siblingpairs = n_pairlevel_ukb)
+
+## combine into separate df's for now
+pwr_alldf <- rbind.data.frame(pwr_FHS_stringent_df,
+                                        pwr_addh_stringent_df,
+                                        pwr_ukb_stringent_df,
+                              pwr_FHS_replication_df,
+                                        pwr_addh_replication_df,
+                                        pwr_ukb_replication_df)
+
+## plot to see similarity with table
+ggplot(pwr_alldf, 
+       aes(x = r2,
+           y = power,
+           color = factor(siblingpairs,
+                          levels = c(583,
+                        852, 22666),
+                labels = c("FHS: 583",
+                           "AddHealth: 852",
+                           "UK Biobank: 22,666")),
+           linetype = factor(sig,
+                levels = c(0.05,
+                           0.00001),
+                labels = c("p < 0.05",
+                           "p < 10^-5"))))  +
+  geom_line() +
+  scale_x_continuous(breaks = seq(0, 0.1,
+                                  by = 0.01)) +
+  scale_y_continuous(breaks = seq(0, 1, 
+                                  by = 0.2)) +
+  xlab("R-squared of Putative Effect") +
+  ylab("Power") +
+  labs(color = "Sample size\n (# of sibling pairs)",
+       linetype = "Sig. threshold") +
+  theme_bw(base_size = 16) +
+  theme(legend.position = c(0.75, 0.25),
+        legend.background = element_blank(),
+        axis.text.x = element_text(color= "black"),
+        axis.text.y = element_text(color = "black"))+
+  geom_hline(yintercept = 0.8,
+             linetype = "dashed",
+             color = "red") +
+  scale_color_brewer(palette = "Dark2")
+
+ggsave("finalfigures/updated_power_analysis.pdf",
+       plot = last_plot(),
+       device = "pdf")
+
+
+## get the average effect size on mean and variance
+## from the 0 cor data
+df_rho0_forpower <- lapply(df_rho0,
+                   function(x)
+                  x <- x %>%
+                  group_by(factor(FID)) %>%
+                  mutate(snp1_minorcount = sum(2 * snp1_min_h +
+                                      snp1_hz)) %>%
+                  ungroup() %>%
+                  dplyr::select(snp1_minorcount,
+                                normal_meaneffect_snp1,
+                                normal_vareffect_snp1))
+
+## get r^2 across replicates
+siblingsd_rho0 <- readRDS("../siblingsd_regs/siblingsd_rho0_sim820.RDS")
+siblingsd_r2 <- summary(lm(normal_vareffect_snp1_siblingsd ~
+            snp1_minorcount,
+           data = siblingsd_rho0))$r.squared
+
+
+pwr.f2.test(u = 2, v =4000  - 2 -1, 
+            f2 = 0.01,
+            sig.level = 0.05,
+            power = NULL)
+
+```
+
+## test for heterozygotes in significant snps
+
+```{r}
+## 2 significant snps
+## for bmi
+## rs41508049
+## rs30731
+
+n <- 583
+rs415mean_homoz <- 24.68343115
+rs415mean_heteroz <- 26.13957198
+rs415se_homoz <- 2.100333387
+rs415se_heteroz <- 0.352509513
+rs415tstat <- (rs415mean_heteroz - rs415mean_homoz)/
+                sqrt((rs415se_heteroz^2 + rs415se_homoz^2)/n)
+
+rs415tstat
+
+rs307mean_homoz <- 28.46986065
+rs307mean_heteroz <- 26.70324167
+rs307se_homoz <- 1.031894876
+rs307se_heteroz <- 0.229730113
+rs307tstat <- (rs307mean_homoz - rs307mean_heteroz)/
+                sqrt((rs307se_heteroz^2 + rs307se_homoz^2)/n) 
+rs307tstat
+
+
+
+```
+
+
+
+## Recreate Manhattan and qqplots
+
+```{r}
+## update manhattan function code 
+## to change snp size
+manhattan <- function(x, chr="CHR", bp="BP", p="P", snp="SNP", 
+                      col=c("gray10", "gray60"), chrlabs=NULL,
+                      suggestiveline=-log10(1e-5), genomewideline=-log10(5e-8), 
+                      highlight=NULL, logp=TRUE, annotatePval = NULL, annotateTop = TRUE, ...) {
+
+    # Not sure why, but package check will warn without this.
+    CHR=BP=P=index=NULL
+    
+    # Check for sensible dataset
+    ## Make sure you have chr, bp and p columns.
+    if (!(chr %in% names(x))) stop(paste("Column", chr, "not found!"))
+    if (!(bp %in% names(x))) stop(paste("Column", bp, "not found!"))
+    if (!(p %in% names(x))) stop(paste("Column", p, "not found!"))
+    ## warn if you don't have a snp column
+    if (!(snp %in% names(x))) warning(paste("No SNP column found. OK unless you're trying to highlight."))
+    ## make sure chr, bp, and p columns are numeric.
+    if (!is.numeric(x[[chr]])) stop(paste(chr, "column should be numeric. Do you have 'X', 'Y', 'MT', etc? If so change to numbers and try again."))
+    if (!is.numeric(x[[bp]])) stop(paste(bp, "column should be numeric."))
+    if (!is.numeric(x[[p]])) stop(paste(p, "column should be numeric."))
+    
+    # Create a new data.frame with columns called CHR, BP, and P.
+    # d=data.frame(CHR=x[[chr]], BP=x[[bp]], P=x[[p]], pos = NA, index = NA) # with millions of SNPs, create dataframe at once 
+	                                                         #  rather than dynamically allocated(see line 72-73, and remove line 87 and line 91 )
+    
+    # If the input data frame has a SNP column, add it to the new data frame you're creating.
+    if (!is.null(x[[snp]])) d = data.frame(CHR=x[[chr]], BP=x[[bp]], P=x[[p]], pos = NA, index = NA ,SNP=x[[snp]], stringsAsFactors = FALSE) else 
+	    d = data.frame(CHR=x[[chr]], BP=x[[bp]], P=x[[p]], pos = NA, index = NA)
+	    
+    
+    # Set positions, ticks, and labels for plotting
+    ## Sort and keep only values where is numeric.
+    #d <- subset(d[order(d$CHR, d$BP), ], (P>0 & P<=1 & is.numeric(P)))
+    #  d <- subset(d, (is.numeric(CHR) & is.numeric(BP) & is.numeric(P)))       ## unused, all three variables are numeric, line:63-65 
+    d <- d[order(d$CHR, d$BP), ]
+    #d$logp <- ifelse(logp, yes=-log10(d$P), no=d$P)
+    if (logp) {
+        d$logp <- -log10(d$P)
+    } else {
+        d$logp <- d$P
+    }
+   # d$pos=NA
+    
+    
+    # Fixes the bug where one chromosome is missing by adding a sequential index column.
+   # d$index=NA
+   # ind = 0
+   # for (i in unique(d$CHR)){
+   #     ind = ind + 1
+   #     d[d$CHR==i,]$index = ind
+   # }
+   d$index = rep.int(seq_along(unique(d$CHR)), times = tapply(d$SNP,d$CHR,length))  # replcace the for loop of line 92-96 to improve efficiency
+    
+    # This section sets up positions and ticks. Ticks should be placed in the
+    # middle of a chromosome. The a new pos column is added that keeps a running
+    # sum of the positions of each successive chromsome. For example:
+    # chr bp pos
+    # 1   1  1
+    # 1   2  2
+    # 2   1  3
+    # 2   2  4
+    # 3   1  5
+    nchr = length(unique(d$CHR))
+    if (nchr==1) { ## For a single chromosome
+        ## Uncomment the next two linex to plot single chr results in Mb
+        #options(scipen=999)
+	    #d$pos=d$BP/1e6
+        d$pos=d$BP
+      #  ticks=floor(length(d$pos))/2+1          ## unused, from code line: 169
+        xlabel = paste('Chromosome',unique(d$CHR),'position')
+      #  labs = ticks          ## unused, from code line: 169
+    } else { ## For multiple chromosomes
+        lastbase=0
+        ticks=NULL
+        for (i in unique(d$index)) {
+            if (i==1) {
+                d[d$index==i, ]$pos=d[d$index==i, ]$BP
+            } else {
+		## chromosome position maybe not start at 1, eg. 9999. So gaps may be produced. 
+		lastbase = lastbase +max(d[d$index==(i-1),"BP"])   # replace line 128
+		d[d$index == i,"BP"] = d[d$index == i,"BP"]-min(d[d$index==i,"BP"]) +1
+		d[d$index == i, "pos"] = d[d$index == i,"BP"] + lastbase    # replace line 129
+                # lastbase=lastbase+tail(subset(d,index==i-1)$BP, 1)
+                # d[d$index==i, ]$pos=d[d$index==i, ]$BP+lastbase
+		   
+            }
+            # Old way: assumes SNPs evenly distributed
+            # ticks=c(ticks, d[d$index==i, ]$pos[floor(length(d[d$index==i, ]$pos)/2)+1])
+            # New way: doesn't make that assumption
+           # ticks = c(ticks, (min(d[d$index == i,]$pos) + max(d[d$index == i,]$pos))/2 + 1)  # see line 136, to reduce the burden of for loop 
+        }
+	ticks <-tapply(d$pos,d$index,quantile,probs=0.5)   # replace line 135
+        xlabel = 'Chromosome'
+        #labs = append(unique(d$CHR),'') ## I forgot what this was here for... if seems to work, remove.
+        labs <- unique(d$CHR)
+    }
+    
+    # Initialize plot
+    xmax = ceiling(max(d$pos) * 1.03)
+    xmin = floor(max(d$pos) * -0.03)
+    
+    # The old way to initialize the plot
+    # plot(NULL, xaxt='n', bty='n', xaxs='i', yaxs='i', xlim=c(xmin,xmax), ylim=c(ymin,ymax),
+    #      xlab=xlabel, ylab=expression(-log[10](italic(p))), las=1, pch=20, ...)
+
+    
+    # The new way to initialize the plot.
+    ## See http://stackoverflow.com/q/23922130/654296
+    ## First, define your default arguments
+    def_args <- list(xaxt='n', bty='n', xaxs='i', yaxs='i', las=1, pch=20,
+                     xlim=c(xmin,xmax), ylim=c(0,ceiling(max(d$logp))),
+                     xlab=xlabel, ylab=expression(-log[10](italic(p))))
+    ## Next, get a list of ... arguments
+    #dotargs <- as.list(match.call())[-1L]
+    dotargs <- list(...)
+    ## And call the plot function passing NA, your ... arguments, and the default
+    ## arguments that were not defined in the ... arguments.
+    do.call("plot", c(NA, dotargs, def_args[!names(def_args) %in% names(dotargs)]))
+    
+    # If manually specifying chromosome labels, ensure a character vector and number of labels matches number chrs.
+    if (!is.null(chrlabs)) {
+        if (is.character(chrlabs)) {
+            if (length(chrlabs)==length(labs)) {
+                labs <- chrlabs
+            } else {
+                warning("You're trying to specify chromosome labels but the number of labels != number of chromosomes.")
+            }
+        } else {
+            warning("If you're trying to specify chromosome labels, chrlabs must be a character vector")
+        }
+    }
+    
+    # Add an axis. 
+    if (nchr==1) { #If single chromosome, ticks and labels automatic.
+        axis(1, ...)
+    } else { # if multiple chrs, use the ticks and labels you created above.
+        axis(1, at=ticks, labels=labs, ...)
+    }
+    
+    # Create a vector of alternatiting colors
+    #col=rep(col, max(d$CHR))  # replaced by line 187
+    col = rep_len(col, max(d$index))  ## mean this one?  the results are same
+
+    # Add points to the plot
+    if (nchr==1) {
+        with(d, points(pos, logp, pch=20, col=col[1], ...))
+    } else {
+        # if multiple chromosomes, need to alternate colors and increase the color index (icol) each chr.
+        icol=1
+        for (i in unique(d$index)) {
+            #with(d[d$index==unique(d$index)[i], ], points(pos, logp, col=col[icol], pch=20, ...))
+	    points(d[d$index==i,"pos"], d[d$index==i,"logp"], col=col[icol], pch=20, ...)
+            icol=icol+1
+        }
+    }
+    
+    # Add suggestive and genomewide lines
+    if (suggestiveline) abline(h=suggestiveline, col="blue")
+    if (genomewideline) abline(h=genomewideline, col="red")
+    
+    # Highlight snps from a character vector
+    if (!is.null(highlight)) {
+        if (any(!(highlight %in% d$SNP))) warning("You're trying to highlight SNPs that don't exist in your results.")
+        d.highlight=d[which(d$SNP %in% highlight), ]
+        with(d.highlight, points(pos, logp, col="green3", pch=20, ...)) 
+    }
+    
+    # Highlight top SNPs
+    if (!is.null(annotatePval)) {
+        # extract top SNPs at given p-val
+        topHits = subset(d, P <= annotatePval)
+        par(xpd = TRUE)
+        # annotate these SNPs
+        if (annotateTop == FALSE) {
+            with(subset(d, P <= annotatePval), 
+                 textxy(pos, -log10(P), offset = 0.625, labs = topHits$SNP, cex = 0.8), ...)
+        }
+        else {
+            # could try alternative, annotate top SNP of each sig chr
+            topHits <- topHits[order(topHits$P),]
+            topSNPs <- NULL
+            
+            for (i in unique(topHits$CHR)) {
+                
+                chrSNPs <- topHits[topHits$CHR == i,]
+                topSNPs <- rbind(topSNPs, chrSNPs[1,])
+                
+            }
+            textxy(topSNPs$pos, -log10(topSNPs$P), offset = 0.625, labs = topSNPs$SNP, cex = 0.8, ...)
+        }
+    }  
+    par(xpd = FALSE)
+}
+
+## old qq function 
+## that has CI parameter
+## we can pass in
+qq <- function(pvector,gridlines=F,gridlines.col='gray83',gridlines.lwd=1,gridlines.lty=1,confidence=T,confidence.col='gray81',
+    pt.cex=0.5,pt.col='black',pt.bg='black',pch=21,abline.col='red',abline.lwd=1.8,abline.lty=1,ymax=8,ymax.soft=T,
+    highlight=NULL,highlight.col=c('green3','magenta'),highlight.bg=c('green3','magenta'),
+    annotate=NULL,annotate.cex=0.7,annotate.font=3,cex.axis=0.95,...) {
+    #======================================================================================================
+    ######## Check data and arguments; create observed and expected distributions
+    d = suppressWarnings(as.numeric(pvector))
+    names(d) = names(pvector)
+    d = d[!is.na(d)] # remove NA, and non-numeric [which were converted to NA during as.numeric()]
+    d = d[d>0 & d<1] # only Ps between 0 and 1
+    
+    
+    if (!is.null(highlight) | !is.null(annotate)){
+        if (is.null(names(d))) stop("P-value vector must have names to use highlight or annotate features.")
+        d = d[!is.na(names(d))]
+        if (!is.null(highlight) & FALSE %in% (highlight %in% names(d))) stop ("D'oh! Highlight vector must be a subset of names(pvector).")
+        if (!is.null(annotate) & FALSE %in% (annotate %in% names(d))) stop ("D'oh! Annotate vector must be a subset of names(pvector).")
+    }
+    
+    d = d[order(d,decreasing=F)] # sort
+    o = -log10(d)
+    e = -log10( ppoints(length(d) ))
+    if (!is.null(highlight) | !is.null(annotate)) names(e) = names(o) = names(d)
+    
+    if (!is.numeric(ymax) | ymax<max(o)) ymax <- max(o) 
+    
+    if (!is.numeric(pt.cex) | pt.cex<0) pt.cex=0.5
+    if (!is.numeric(annotate.cex) | annotate.cex<0) annotate.cex=0.7
+    if (!is.numeric(annotate.font)) annotate.font=3
+    
+    if (is.character(gridlines.col[1]) & !(gridlines.col[1] %in% colors())) gridlines.col = 'gray83'
+    if (is.character(confidence.col[1]) & !(confidence.col[1] %in% colors())) confidence.col = 'gray81'
+    if (is.character(abline.col[1]) & !(abline.col[1] %in% colors())) abline.col = 'red'
+    
+    if (FALSE %in% (pt.col %in% colors() | !is.na(suppressWarnings(as.numeric(pt.col))) )){
+        pt.col = 'black'; warning("pt.col argument(s) not recognized. Setting to default: 'black'.")
+    }
+
+    if (FALSE %in% (pt.bg %in% colors() | !is.na(suppressWarnings(as.numeric(pt.bg))) )){
+        pt.bg = 'black'; warning("pt.bg argument(s) not recognized. Setting to default: 'black'.")
+    }
+    
+    if (FALSE %in% (highlight.col %in% colors() | !is.na(suppressWarnings(as.numeric(highlight.col))) )){
+        highlight.col = 'blue'; warning("highlight.col argument(s) not recognized. Setting to default: 'blue'.")
+    }
+
+    if (FALSE %in% (highlight.bg %in% colors() | !is.na(suppressWarnings(as.numeric(highlight.bg))) )){
+        highlight.bg = 'blue'; warning("highlight.bg argument(s) not recognized. Setting to default: 'blue'.")
+    }
+    
+    # Ymax
+    if(is.na(suppressWarnings(as.numeric(ymax)))){  # not numeric
+        ymax = ceiling(max(o))
+        warning('non-numeric ymax argument.')
+    } else if (as.numeric(ymax) < 0){           # negative
+        ymax = ceiling(max(o))
+        warning('negative ymax argument.')
+    }
+    if (ymax.soft==T){ #if soft, ymax is just the lower limit for ymax
+        ymax = max(ymax, ceiling(max(o)))
+    } #else, ymax = ymax
+            
+    
+    ################################
+    
+    # Initialize plot
+    #print('Setting up plot.')
+    #print(ymax)
+    xspace = 0.078
+    xmax = max(e) * 1.019
+    xmin = max(e) * -0.035
+    #ymax = ceiling(ymax * 1.03)
+    ymin = -ymax*0.03
+    plot(0,xlab=expression(Expected~~-log[10](italic(p))),ylab=expression(Observed~~-log[10](italic(p))),
+            col=F,las=1,xaxt='n',xlim=c(xmin,xmax),ylim=c(ymin,ymax),bty='n',xaxs='i',yaxs='i',cex.axis=cex.axis, ...)
+    axis(side=1,labels=seq(0,max(e),1),at=seq(0,max(e),1),cex.axis=cex.axis,lwd=0,lwd.ticks=1)
+    
+    # Grid lines
+    if (isTRUE(gridlines)){
+        yvals = par('yaxp')
+        yticks = seq(yvals[1],yvals[2],yvals[2]/yvals[3])
+        abline(v=seq(0,max(e),1),col=gridlines.col[1],lwd=gridlines.lwd,lty=gridlines.lty)
+        abline(h=yticks,col=gridlines.col[1],lwd=gridlines.lwd,lty=gridlines.lty)
+    }
+    
+     #Confidence intervals
+     find_conf_intervals = function(row){
+        i = row[1]
+        len = row[2]
+        if (i < 10000 | i %% 100 == 0){
+            return(c(-log10(qbeta(0.95,i,len-i+1)), -log10(qbeta(0.05,i,len-i+1))))
+        } else { # Speed up
+            return(c(NA,NA))
+        }
+     }
+
+     # Find approximate confidence intervals
+    if (isTRUE(confidence)){
+        #print('Plotting confidence intervals.')
+        ci = apply(cbind( 1:length(e), rep(length(e),length(e))), MARGIN=1, FUN=find_conf_intervals)
+        bks = append(seq(10000,length(e),100),length(e)+1)
+        for (i in 1:(length(bks)-1)){
+            ci[1, bks[i]:(bks[i+1]-1)] = ci[1, bks[i]]
+            ci[2, bks[i]:(bks[i+1]-1)] = ci[2, bks[i]]
+        }
+        colnames(ci) = names(e)
+        # Extrapolate to make plotting prettier (doesn't affect intepretation at data points)
+        slopes = c((ci[1,1] - ci[1,2]) / (e[1] - e[2]), (ci[2,1] - ci[2,2]) / (e[1] - e[2]))
+        extrap_x = append(e[1]+xspace,e) #extrapolate slightly for plotting purposes only
+        extrap_y = cbind( c(ci[1,1] + slopes[1]*xspace, ci[2,1] + slopes[2]*xspace), ci)
+        
+        polygon(c(extrap_x, rev(extrap_x)), c(extrap_y[1,], rev(extrap_y[2,])),col = confidence.col[1], border = confidence.col[1]) 
+    }
+    
+    # Points (with optional highlighting)
+    #print('Plotting data points.')
+    fills = rep(pt.bg,length(o))
+    borders = rep(pt.col,length(o))
+    names(fills) = names(borders) = names(o)
+    if (!is.null(highlight)){   
+        borders[highlight] = rep(NA,length(highlight))
+        fills[highlight] = rep(NA,length(highlight))
+    }
+    points(e,o,pch=pch,cex=pt.cex,col=borders,bg=fills)
+    
+    if (!is.null(highlight)){
+        points(e[highlight],o[highlight],pch=pch,cex=pt.cex,col=highlight.col,bg=highlight.bg)
+    }
+    
+    #Abline
+    abline(0,1,col=abline.col,lwd=abline.lwd,lty=abline.lty)
+    
+    # Annotate SNPs
+    if (!is.null(annotate)){
+        x = e[annotate] # x will definitely be the same
+        y = -0.1 + apply(rbind(o[annotate],ci[1,annotate]),2,min)
+        text(x,y,labels=annotate,srt=90,cex=annotate.cex,adj=c(1,0.48),font=annotate.font)      
+    }
+    # Box
+    box()
+}
+
+
+
+
+```
+
+
+
+
+## BMI pathway analysis
+
+
+```{r}
+## gene scores 
+bmi_fhs_pathway <- read.table("BMI_vegas.PathwaySet--msigBIOCARTA_KEGG_REACTOME--sum.txt",
+                       header = TRUE) 
+bmi_mn_pathway <- read.table("bmi_mn_all.PathwaySet--msigBIOCARTA_KEGG_REACTOME--sum.txt",
+                       header = TRUE) 
+
+sig_discov_rep_pathway <- function(pval, data1, data2){
+  data1_sig <- as.character((data1 %>% filter(chi2Pvalue < pval))$Name)
+  data2_sig <- as.character((data2 %>% filter(chi2Pvalue < pval))$Name)
+  return(intersect(data1_sig, data2_sig))
+}
+
+pval <- c(0.05, 0.01, 0.001, 0.0001)
+pathway_sigboth_bmi <- sapply(pval, sig_discov_rep_pathway, 
+      data1 = bmi_fhs_pathway,
+       data2 = bmi_mn_pathway)
+
+pathway_sigboth_bmi_df <- data.frame(pval = pval,
+                                    sig_genes = c(paste(pathway_sigboth_bmi[[1]],
+                                                collapse = ","),
+                                          paste(pathway_sigboth_bmi[[2]],
+                                                collapse = ","),
+                                          paste(pathway_sigboth_bmi[[3]],
+                                                collapse = ","),
+                                          paste(pathway_sigboth_bmi[[4]],
+                                                collapse = ",")))  
+
+print(xtable(pathway_sigboth_bmi_df, digits = c(4, 4, 4)))
+
+
+```
+
+
+
+## Figures for presentation
+
+
+```{r}
+## 
+
+df_rho0_vars4plot <- df_rho0[[1]] %>%
+                  mutate(snp1_minorcount = 2 * snp1_min_h +
+                                      snp1_hz,
+                         strongmean = 2*snp1_minorcount + 
+                           rnorm(8000, mean = 0, sd = 1)) %>%
+                  dplyr::select(strongmean,
+                                snp1_minorcount)
+
+n_perallele <- table(df_rho0_vars4plot$snp1_minorcount)
+n_perallele["0"]
+
+df_rho0_vars4plot <- df_rho0_vars4plot %>%
+  mutate(strongvar = ifelse(snp1_minorcount == 0,
+        rnorm(n_perallele["0"],
+              mean = 0,
+              sd = 1),
+      ifelse(snp1_minorcount == 1,
+      rnorm(n_perallele["1"],
+            mean = 0,
+            sd = 2),
+      rnorm(n_perallele["2"],
+            mean = 0,
+            sd = 3))))
+
+## blank graph
+ggplot(df_rho0_vars4plot, aes(x = factor(snp1_minorcount),
+                                   y =strongmean))  +
+  geom_point(color = "white") +
+  theme_new(base_size = 24) +
+  xlab("Count of minor alleles") +
+  ylab("Values of trait") +
+  guides(color = FALSE)  
+ggsave("../siblingSD_labpres/simple_meaneffect_blank.pdf",
+       plot = last_plot(),
+       device = "pdf")
+
+## create schematic of variance effects using one simulation
+ggplot(df_rho0_vars4plot, aes(x = factor(snp1_minorcount),
+                                   y =strongmean,
+                          color = factor(snp1_minorcount))) +
+  geom_point() +
+  theme_new(base_size = 24) +
+  xlab("Count of minor alleles") +
+  ylab("Values for trait") +
+  guides(color = FALSE) +
+  scale_color_brewer(palette = "Dark2")
+
+ggsave("../siblingSD_labpres/simple_meaneffect.pdf",
+       plot = last_plot(),
+       device = "pdf")
+
+## mean of trait
+trait_mean <- df_rho0_vars4plot %>%
+          group_by(snp1_minorcount) %>%
+          summarise(mean = mean(strongvar)) 
+trait_mean
+
+ggplot(df_rho0_vars4plot, aes(x = factor(snp1_minorcount),
+                                   y =strongvar,
+                          color = factor(snp1_minorcount))) +
+  geom_point() +
+  theme_new(base_size = 24) +
+  xlab("Count of minor alleles") +
+  ylab("Values for trait") +
+  guides(color = FALSE) +
+  scale_color_brewer(palette = "Dark2")
+
+ggsave("../siblingSD_labpres/simple_vareffect.pdf",
+       plot = last_plot(),
+       device = "pdf")
+
+
+```
+
+
+
+## Heterozygote test
+
+```{r}
+## load df
+setwd("../reviseresubmit_simulation/olderfigures_updatingresolution")
+hetero_test <- read.csv("heterozygote_mean_se_clean.csv",
+                        header = TRUE)
+
+## subset to minor_combo 1-1 versus 0-2
+hetero_compare <- hetero_test %>%
+            filter(minor_combo %in% c("1_1",
+                                      "0_2")) %>%
+            melt(id.vars = c("minor_combo", "trait", "parameter")) %>%
+            rename(SNP = variable) %>%
+            filter(SNP != "rs8029740" & parameter != "count") %>%
+            dcast(SNP + minor_combo + trait ~ parameter) %>%
+            mutate(lower = mean-SE,
+                   upper = mean+SE)
+
+hetero_compare_for_t <- hetero_test %>%
+            filter(minor_combo %in% c("1_1",
+                                      "0_2")) %>%
+            melt(id.vars = c("minor_combo", "trait", "parameter")) %>%
+            rename(SNP = variable) %>%
+            filter(SNP != "rs8029740" & parameter != "count") %>%
+            dcast(SNP + minor_combo + trait ~ parameter) 
+head(hetero_compare_for_t)
+hetero_count <- hetero_test %>%
+              filter(parameter == "count") %>%
+              dplyr::select(-trait) %>%
+              melt(id.vars = c("minor_combo")) %>%
+              rename(SNP = variable,
+                     N = value) 
+
+hetero_final_t <- merge(hetero_compare_for_t,
+                        hetero_count,
+                        by = c("minor_combo", 
+                               "SNP"),
+                        all.x = TRUE)
+
+
+## restrict to significant height snps
+sig_bmi <- c("rs41508049", "rs30731")
+sig_height <- setdiff(unique(hetero_compare$SNP),
+              sig_bmi) 
+height_het_test <- ggplot(hetero_compare[hetero_compare$trait == "height" &
+        hetero_compare$SNP %in% sig_height, 
+        ], aes(x = factor(SNP),
+          y = mean, fill = factor(minor_combo,
+          levels = c("0_2", 
+                     "1_1"),
+          labels = c("Homozygotes (0-2)",
+                     "Heterozygotes (1-1)")),
+          group = factor(minor_combo))) +
+  geom_bar(position = position_dodge(width = 0.9),
+            stat = "identity",
+           alpha = 0.8) +
+  geom_errorbar(aes(ymin = lower,
+                    ymax = upper,
+                    group = factor(minor_combo)),
+            width = 0.2,
+            size = 1,
+            position = position_dodge(0.9)) +
+  theme_new(base_size = 16) +
+  xlab("SNP") +
+  ylab("Height (in.)\n (Mean and SE)") +
+  scale_fill_manual(values = 
+    c("firebrick",
+      "dodgerblue4")) +
+  coord_cartesian(ylim=c(60,70)) +
+  theme(legend.position = c(0.3, 0.9),
+        legend.background = element_blank())+
+  guides(fill = FALSE) +
+  annotate("text",
+           x = 0.7,
+           y = 69,
+           label = "A.",
+           size = 8)
+
+
+ggsave("height_het_test.pdf",
+       plot = last_plot(),
+       device = "pdf")
+
+
+bmi_het_test <- ggplot(hetero_compare[hetero_compare$trait == "BMI" &
+        hetero_compare$SNP %in% sig_bmi, 
+        ], aes(x = factor(SNP),
+          y = mean, fill = factor(minor_combo,
+          levels = c("0_2", 
+                     "1_1"),
+          labels = c("Homozygotes (0-2)",
+                     "Heterozygotes (1-1)")),
+          group = factor(minor_combo))) +
+  geom_bar(position = position_dodge(width = 0.9),
+           stat = "identity",
+           alpha = 0.8) +
+  geom_errorbar(aes(ymin = lower,
+                    ymax = upper,
+                    group = factor(minor_combo)),
+            width = 0.1,
+            size = 1,
+            position = position_dodge(0.9)) +
+  theme_new(base_size = 16) +
+  xlab("SNP") +
+  ylab("BMI\n (Mean and SE)") +
+  scale_fill_manual(values = 
+    c("firebrick",
+      "dodgerblue4")) +
+  theme(legend.position = "bottom",
+        legend.background = element_blank())+
+  labs(fill = "") +
+  ylim(0, 32) +
+  annotate("text", 
+           x = 0.6,
+           y = 31,
+           label = "B.",
+           size = 8)
+
+
+htbm_het_test <- grid.arrange(height_het_test,
+            bmi_het_test, ncol = 1)
+
+ggsave("../finalfigures/Fig5.tiff",
+       plot = htbm_het_test,
+       device = "tiff",
+       dpi = 400) 
+
+ggsave("../finalfigures/Fig5.pdf",
+       plot = htbm_het_test,
+       device = "pdf")
+
+
+## run t.test on all of them
+
+manual.t.func <- function(snp, data){
+  snp_subset <- data %>% filter(SNP == snp)  
+  test_stat <- (snp_subset$mean[1] - snp_subset$mean[2])/
+              sqrt(snp_subset$SE[1]^2 + snp_subset$SE[2]^2) 
+  pval <- 2 * pt(abs(test_stat), (as.numeric(snp_subset$N[1]) + 
+            as.numeric(snp_subset$N[2]) - 2), lower = FALSE)
+  return(c(test_stat, pval))
+}
+
+all_ht_tests <- sapply(unique(hetero_final_t$SNP),
+                       manual.t.func,
+                       data = hetero_final_t[hetero_final_t$trait == "height", ])
+colnames(all_ht_tests) <- unique(hetero_final_t$SNP)
+all_ht_tests
+
+all_bmi_tests <- sapply(unique(hetero_final_t$SNP),
+                       manual.t.func,
+                       data = hetero_final_t[hetero_final_t$trait == "BMI", ])
+
+colnames(all_bmi_tests) <- unique(hetero_final_t$SNP)
+all_bmi_tests
+
+```
+
+
+
